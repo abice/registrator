@@ -1,14 +1,9 @@
 package route53
 
 import (
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net"
-	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 
@@ -24,6 +19,7 @@ const EC2MetaDataKey = "useEC2MetadataForHostname"
 const DNSPrefix = "dnsPrefix"
 const PublishPublicARecord = "publicarecord"
 const PublishLocalARecord = "localarecord"
+const RecordPerHost = "recordPerHost"
 const TTL = 30
 
 func init() {
@@ -46,19 +42,27 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 	dnsPrefix := q.Get(DNSPrefix)
 	log.Printf("Route53: dnsPrefix %s", dnsPrefix)
 
-	// route53 zone ID
-	zoneId := uri.Host
-
-	if zoneId == "" {
-		log.Fatal("must provide zoneId. e.g. route53://zoneId")
+	rph := q.Get(RecordPerHost)
+	recordPerHost, err := strconv.ParseBool(rph)
+	if err != nil {
+		recordPerHost = false
 	}
-	log.Printf("Route53: ZoneID %s\n", zoneId)
+	log.Printf("Route53: recordPerHost %t", recordPerHost)
+
+	// route53 zone ID
+	zoneID := uri.Host
+
+	if zoneID == "" {
+		log.Fatal("must provide zoneID. e.g. route53://zoneID")
+	}
+	log.Printf("Route53: ZoneID %s\n", zoneID)
 
 	return &Route53Registry{client: r53.New(session.New()),
 		path:            uri.Path,
 		useEc2Meatadata: useEc2Meatadata,
-		zoneId:          zoneId,
+		zoneID:          zoneID,
 		dnsPrefix:       dnsPrefix,
+		recordPerHost:   recordPerHost,
 	}
 }
 
@@ -66,17 +70,19 @@ type Route53Registry struct {
 	client          route53iface.Route53API
 	path            string
 	useEc2Meatadata bool
-	zoneId          string
+	zoneID          string
 	dnsSuffix       string
 	dnsPrefix       string
 	hostname        string
+	recordPerHost   bool
+	containerLookup map[string]string
 }
 
 // Ping gets the hosted zone name. This name will be used
 // as a suffix to all DNS name entries
 func (r *Route53Registry) Ping() error {
 	params := &r53.GetHostedZoneInput{
-		Id: aws.String(r.zoneId),
+		Id: aws.String(r.zoneID),
 	}
 	resp, err := r.client.GetHostedZone(params)
 	if err != nil {
@@ -92,10 +98,12 @@ func (r *Route53Registry) Ping() error {
 }
 
 func (r *Route53Registry) Services() ([]*bridge.Service, error) {
+	hostname := r.getHostname()
 	params := &r53.ListResourceRecordSetsInput{
-		HostedZoneId:    aws.String(r.zoneId),
-		StartRecordType: aws.String("SRV"),
-		StartRecordName: aws.String(fmt.Sprintf("*.%s", r.dnsSuffix)),
+		HostedZoneId:          aws.String(r.zoneID),
+		StartRecordType:       aws.String(r53.RRTypeTxt),
+		StartRecordName:       aws.String(r.getTxtDomain()),
+		StartRecordIdentifier: aws.String(r.getHostname()),
 	}
 
 	resp, err := r.client.ListResourceRecordSets(params)
@@ -105,32 +113,43 @@ func (r *Route53Registry) Services() ([]*bridge.Service, error) {
 
 	services := make([]*bridge.Service, 0, len(resp.ResourceRecordSets))
 	for _, rrs := range resp.ResourceRecordSets {
+		if r53.RRTypeTxt != *rrs.Type {
+			log.Printf("Skipping non TXT record for services")
+			continue
+		}
 		log.Printf("ResourceRecordSets %s", rrs.GoString())
 
 		for _, record := range rrs.ResourceRecords {
 			if record.Value == nil {
-				log.Println("Route53: Skipping null SRV Record Value")
+				log.Println("Route53: Skipping null Record Value")
 				continue
 			}
-			parts := strings.Split(*record.Value, ` `)
-			if len(parts) != 4 {
-				log.Printf("Route53: Skipping malformed SRV record: %s\n", *record.Value)
+			value := strings.TrimSuffix(strings.TrimPrefix(*record.Value, `"`), `"`)
+			// ip-10-174-54-189:ecs-fluentd-aggr-7-fluentd-aggr-def08de0ae8ef9977c00:24225
+			parts := strings.Split(value, `:`)
+			if len(parts) != 3 {
+				log.Printf("Route53: Skipping malformed Registrator Service record: %s\n", value)
 				continue
 			}
-			port, err := strconv.Atoi(parts[2])
-			if err != nil {
-				log.Println("Route53: Skipping unparseable port")
-				continue
-			}
+			if parts[0] == hostname || parts[0] == r.getLocalHostname() {
+				// This is a local service, so we should return it.
+				port, err := strconv.Atoi(parts[2])
+				if err != nil {
+					log.Println("Route53: Skipping unparseable port")
+					continue
+				}
 
-			services = append(services, &bridge.Service{
-				ID:   fmt.Sprintf("%d_%s", port, parts[3]),
-				Name: *rrs.Name,
-				Port: port,
-				TTL:  (int)(*rrs.TTL),
-			})
+				services = append(services, &bridge.Service{
+					ID:   value,
+					Name: strings.TrimSuffix(strings.Replace(*rrs.Name, r.dnsSuffix, ``, -1), `.`),
+					Port: port,
+					TTL:  (int)(*rrs.TTL),
+				})
+			}
 		}
 	}
+
+	log.Println("Existing Services", services)
 
 	return services, err
 }
@@ -146,92 +165,15 @@ func (r *Route53Registry) Register(service *bridge.Service) error {
 	r.updateLocalARecord(service, "UPSERT")
 	r.updatePublicARecord(service, "UPSERT")
 
-	// append our new record and persist
-	var recordSet ResourceRecordSet
-	recordSet, err := r.GetServiceEntry(r.zoneId, name)
+	r.appendToRecordSet(r.getTxtDomain(), r53.RRTypeTxt, fmt.Sprintf(`"%s"`, service.ID), r.getHostname())
 
-	if recordSet.nameIs(name) {
-		// update existing DNS record
-		value := fmt.Sprintf("1 1 %d %s", service.Port, hostname)
-		log.Println("Updating DNS entry for", name, "adding values", value)
-		// Since MaxItems is set to 1 we'll only ever get a single record
-		// get the resource records associated with this name
-		var resourceRecords ResourceRecords = recordSet[0].ResourceRecords
-
-		resourceRecords = append(resourceRecords, &r53.ResourceRecord{Value: aws.String(value)})
-		r.UpdateDns(r.zoneId, name, "UPSERT", resourceRecords)
-	} else {
-		// Create new DNS record
-		value := fmt.Sprintf("1 1 %d %s", service.Port, hostname)
-		log.Println("Creating new DNS Entry for", name, "with value", value)
-		resourceRecord := []*r53.ResourceRecord{
-			&r53.ResourceRecord{
-				Value: aws.String(value),
-			},
-		}
-		r.UpdateDns(r.zoneId, name, "UPSERT", resourceRecord)
-	}
+	err := r.appendToRecordSet(name, r53.RRTypeSrv, fmt.Sprintf("1 1 %d %s", service.Port, hostname), r.getRecordID(name))
 
 	return err
 }
 
-func (r *Route53Registry) updateLocalARecord(service *bridge.Service, action string) error {
-	name := service.Name + "." + r.dnsSuffix
-	result := false
-	if pubRecord, ok := service.Attrs[PublishLocalARecord]; ok {
-		publishRecord, err := strconv.ParseBool(pubRecord)
-		if err == nil {
-			result = publishRecord
-		}
-	}
-	if result {
-		log.Printf("Route53: Updating LocalARecord %s\n", name)
-		err := r.UpdateDnsRecordSet(r.zoneId, name, action, &r53.ResourceRecordSet{ // Required
-			Name: aws.String(name), // Required
-			Type: aws.String("A"),  // Required
-			ResourceRecords: []*r53.ResourceRecord{
-				&r53.ResourceRecord{
-					Value: aws.String(r.getLocalIPv4()),
-				},
-			},
-			SetIdentifier: aws.String(r.getHostname()),
-			TTL:           aws.Int64(TTL),
-			Weight:        aws.Int64(1),
-		})
-		return err
-	}
-	return nil
-}
-
-func (r *Route53Registry) updatePublicARecord(service *bridge.Service, action string) error {
-	name := service.Name + "." + r.dnsSuffix
-	result := false
-	if pubRecord, ok := service.Attrs[PublishPublicARecord]; ok {
-		publishRecord, err := strconv.ParseBool(pubRecord)
-		if err == nil {
-			result = publishRecord
-		}
-	}
-	if result {
-		log.Printf("Route53: Updating PublicARecord %s\n", name)
-		err := r.UpdateDnsRecordSet(r.zoneId, name, action, &r53.ResourceRecordSet{ // Required
-			Name: aws.String(name), // Required
-			Type: aws.String("A"),  // Required
-			ResourceRecords: []*r53.ResourceRecord{
-				&r53.ResourceRecord{
-					Value: aws.String(r.getPublicIPv4()),
-				},
-			},
-			SetIdentifier: aws.String(r.getHostname()),
-			TTL:           aws.Int64(TTL),
-			Weight:        aws.Int64(1),
-		})
-		return err
-	}
-	return nil
-}
-
 func (r *Route53Registry) Deregister(service *bridge.Service) error {
+	log.Printf("Route53: Deregistering service %s || %s\n", service.ID, service.Name)
 
 	// query Route53 for existing records
 	name := service.Name + "." + r.dnsSuffix
@@ -241,33 +183,8 @@ func (r *Route53Registry) Deregister(service *bridge.Service) error {
 
 	r.updateLocalARecord(service, "DELETE")
 	r.updatePublicARecord(service, "DELETE")
-
-	// Query Route 53 for for DNS record
-	var recordSet ResourceRecordSet
-	recordSet, err := r.GetServiceEntry(r.zoneId, name)
-	if err != nil {
-		return err
-	}
-
-	if recordSet.nameIs(name) {
-		// find the position of the value to deregister
-		var resourceRecords ResourceRecords = recordSet[0].ResourceRecords
-		pos := resourceRecords.pos(hostname)
-		// remove record from set
-		if pos != -1 {
-			if len(resourceRecords) == 1 {
-				// delete this DNS record set
-				// the only associated value is the one we're removing
-				r.UpdateDns(r.zoneId, name, "DELETE", resourceRecords)
-			} else {
-				// Remove the value referenced in the SRV record, do not remove the DNS entry
-				resourceRecords = append(resourceRecords[:pos], resourceRecords[pos+1:]...)
-				r.UpdateDns(r.zoneId, name, "UPSERT", resourceRecords)
-			}
-		}
-	} else {
-		log.Println("Could not find service", name, "to deregister")
-	}
+	err := r.removeFromRecordSet(name, r53.RRTypeSrv, fmt.Sprintf("1 1 %d %s", service.Port, hostname), r.getRecordID(name))
+	r.removeFromRecordSet(r.getTxtDomain(), r53.RRTypeTxt, service.ID, r.getHostname())
 
 	return err
 }
@@ -276,12 +193,13 @@ func (r *Route53Registry) Refresh(service *bridge.Service) error {
 	return nil
 }
 
-// Gets route53 service entry for the provided zoneId and recordName
-func (r *Route53Registry) GetServiceEntry(zoneId string, recordName string) ([]*r53.ResourceRecordSet, error) {
+// GetServiceEntry gets route53 service entry for the provided zoneID and recordName
+func (r *Route53Registry) GetServiceEntry(zoneID string, recordName string, recordType string, identifier string) ([]*r53.ResourceRecordSet, error) {
 	params := &r53.ListResourceRecordSetsInput{
-		HostedZoneId:          aws.String(zoneId),
+		HostedZoneId:          aws.String(zoneID),
 		StartRecordName:       aws.String(recordName),
-		StartRecordIdentifier: aws.String(r.getHostname()),
+		StartRecordIdentifier: aws.String(identifier),
+		StartRecordType:       aws.String(recordType),
 		MaxItems:              aws.String("1"),
 	}
 
@@ -290,27 +208,27 @@ func (r *Route53Registry) GetServiceEntry(zoneId string, recordName string) ([]*
 	if _, ok := err.(awserr.Error); ok {
 		if reqErr, ok := err.(awserr.RequestFailure); ok {
 			// a service error occurred
-			log.Println(reqErr.Code(), reqErr.Message(), reqErr.StatusCode(), reqErr.RequestID())
+			log.Println("Route53: Error getting resource record sets:", reqErr.Code(), reqErr.Message(), reqErr.StatusCode(), reqErr.RequestID())
 		}
 	}
 
 	return resp.ResourceRecordSets, err
 }
 
-// updates DNS entry for the provided zoneId and record name
-func (r *Route53Registry) UpdateDns(zoneId string, recordName string, action string, resourceRecords []*r53.ResourceRecord) error {
-	return r.UpdateDnsRecordSet(zoneId, recordName, action, &r53.ResourceRecordSet{ // Required
+// UpdateDNS updates DNS entry for the provided zoneID and record name
+func (r *Route53Registry) UpdateDNS(zoneID, recordName, action, recordType, identifier string, resourceRecords []*r53.ResourceRecord) error {
+	return r.UpdateDNSRecordSet(zoneID, recordName, action, &r53.ResourceRecordSet{ // Required
 		Name:            aws.String(recordName), // Required
-		Type:            aws.String("SRV"),      // Required
+		Type:            aws.String(recordType), // Required
 		ResourceRecords: resourceRecords,
-		SetIdentifier:   aws.String(r.getHostname()),
+		SetIdentifier:   aws.String(identifier),
 		TTL:             aws.Int64(TTL),
 		Weight:          aws.Int64(1),
 	})
 }
 
-// updates DNS entry for the provided zoneId and record name
-func (r *Route53Registry) UpdateDnsRecordSet(zoneId string, recordName string, action string, resourceRecordSet *r53.ResourceRecordSet) error {
+// UpdateDNSRecordSet is a generic method for calling the Route53 ChangeResourceRecordSets call
+func (r *Route53Registry) UpdateDNSRecordSet(zoneID string, recordName string, action string, resourceRecordSet *r53.ResourceRecordSet) error {
 
 	params := &r53.ChangeResourceRecordSetsInput{
 		ChangeBatch: &r53.ChangeBatch{ // Required
@@ -322,7 +240,7 @@ func (r *Route53Registry) UpdateDnsRecordSet(zoneId string, recordName string, a
 			},
 			Comment: aws.String(fmt.Sprintf("Updated recordset for %s", recordName)),
 		},
-		HostedZoneId: aws.String(zoneId), // Required
+		HostedZoneId: aws.String(zoneID), // Required
 	}
 	_, err := r.client.ChangeResourceRecordSets(params)
 
@@ -358,114 +276,132 @@ func (slice ResourceRecordSet) nameIs(name string) bool {
 	return false
 }
 
-func (r *Route53Registry) getHostname() string {
-	if "" == r.hostname {
-		// determine the hostname
-		if r.useEc2Meatadata {
-			var hnerr error
-			r.hostname, hnerr = ec2Meta("hostname")
-			if hnerr != nil {
-				log.Fatal("Unable to determine EC2 hostname, defaulting to HOSTNAME")
-				r.hostname, _ = os.Hostname()
+func (slice ResourceRecordSet) typeIs(t string) bool {
+	if slice != nil && *slice[0].Type == t {
+		return true
+	}
+	return false
+}
+
+func (r *Route53Registry) updateLocalARecord(service *bridge.Service, action string) error {
+	name := service.Name + "." + r.dnsSuffix
+	result := false
+	if pubRecord, ok := service.Attrs[PublishLocalARecord]; ok {
+		publishRecord, err := strconv.ParseBool(pubRecord)
+		if err == nil {
+			result = publishRecord
+		}
+	}
+	var err error
+	if result {
+		switch strings.ToUpper(action) {
+		case "UPSERT":
+			log.Printf("Route53: Appending LocalARecord %s\n", name)
+			err = r.appendToRecordSet(name, r53.RRTypeA, r.getLocalIPv4(), r.getRecordID(name))
+			break
+		case "DELETE":
+			log.Printf("Route53: Appending LocalARecord %s\n", name)
+			err = r.removeFromRecordSet(name, r53.RRTypeA, r.getLocalIPv4(), r.getRecordID(name))
+			break
+		default:
+			log.Printf("Unknown action: %s", action)
+		}
+		return err
+	}
+	return nil
+}
+
+func (r *Route53Registry) updatePublicARecord(service *bridge.Service, action string) error {
+	name := service.Name + "." + r.dnsSuffix
+	result := false
+	if pubRecord, ok := service.Attrs[PublishPublicARecord]; ok {
+		publishRecord, err := strconv.ParseBool(pubRecord)
+		if err == nil {
+			result = publishRecord
+		}
+	}
+	var err error
+	if result {
+		switch strings.ToUpper(action) {
+		case "UPSERT":
+			log.Printf("Route53: Appending PublicARecord %s\n", name)
+			err = r.appendToRecordSet(name, r53.RRTypeA, r.getPublicIPv4(), r.getRecordID(name))
+			break
+		case "DELETE":
+			log.Printf("Route53: Appending PublicARecord %s\n", name)
+			err = r.removeFromRecordSet(name, r53.RRTypeA, r.getPublicIPv4(), r.getRecordID(name))
+			break
+		default:
+			log.Printf("Unknown action: %s", action)
+		}
+		return err
+	}
+	return nil
+}
+
+func (r *Route53Registry) appendToRecordSet(name string, recordType string, value string, identifier string) error {
+	var recordSet ResourceRecordSet
+	recordSet, err := r.GetServiceEntry(r.zoneID, name, recordType, identifier)
+	if err != nil {
+		return err
+	}
+
+	if recordSet.nameIs(name) && recordSet.typeIs(recordType) {
+		// update existing DNS record
+		log.Println("Updating DNS entry for", recordType, name, "adding values", value)
+		// Since MaxItems is set to 1 we'll only ever get a single record
+		// get the resource records associated with this name
+		var resourceRecords ResourceRecords = recordSet[0].ResourceRecords
+		resourceRecords = append(resourceRecords, &r53.ResourceRecord{Value: aws.String(value)})
+
+		err = r.UpdateDNS(r.zoneID, name, "UPSERT", recordType, identifier, resourceRecords)
+	} else {
+		// Create new DNS record
+		log.Println("Creating new DNS Entry for", recordType, name, "with value", value)
+		resourceRecord := []*r53.ResourceRecord{
+			&r53.ResourceRecord{
+				Value: aws.String(value),
+			},
+		}
+		err = r.UpdateDNS(r.zoneID, name, "UPSERT", recordType, identifier, resourceRecord)
+	}
+	return err
+}
+
+func (r *Route53Registry) removeFromRecordSet(name string, recordType string, value string, identifier string) error {
+	var recordSet ResourceRecordSet
+	recordSet, err := r.GetServiceEntry(r.zoneID, name, recordType, identifier)
+	if err != nil {
+		return err
+	}
+
+	if recordSet.nameIs(name) && recordSet.typeIs(recordType) {
+		// find the position of the value to deregister
+		var resourceRecords ResourceRecords = recordSet[0].ResourceRecords
+		pos := resourceRecords.pos(value)
+
+		// remove record from set
+		if pos != -1 {
+			if len(resourceRecords) == 1 {
+				// delete this DNS record set
+				// the only associated value is the one we're removing
+				r.UpdateDNS(r.zoneID, name, "DELETE", recordType, identifier, resourceRecords)
+			} else {
+				// Remove the value referenced in the record, do not remove the DNS entry
+				resourceRecords = append(resourceRecords[:pos], resourceRecords[pos+1:]...)
+				r.UpdateDNS(r.zoneID, name, "UPSERT", recordType, identifier, resourceRecords)
 			}
 		} else {
-			var hnerr error
-			r.hostname, hnerr = os.Hostname()
-			if hnerr != nil {
-				log.Fatal("Can't get host name", hnerr)
-			}
+			log.Println("Could not find service", recordType, name, "to deregister")
 		}
 	}
-	return r.hostname
+	return err
 }
 
-// Uses ec2 metadata service
-// see http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html
-func ec2Meta(key string) (string, error) {
-	resp, err := http.Get("http://169.254.169.254/latest/meta-data/" + key)
-	if err != nil {
-		log.Fatal("Error getting meta-data ", err)
+func (r *Route53Registry) getRecordID(recordName string) string {
+	if r.recordPerHost {
+		return r.getHostname()
 	}
 
-	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
-
-	return string(data[:]), err
-}
-
-func (r *Route53Registry) getLocalIPv4() string {
-	var ipv4 string
-	// determine the hostname
-	if r.useEc2Meatadata {
-		var hnerr error
-		ipv4, hnerr = ec2Meta("local-ipv4")
-		if hnerr != nil {
-			log.Fatal("Unable to determine EC2 hostname, defaulting to HOSTNAME")
-			ipv4, _ = externalIP()
-		}
-	} else {
-		var hnerr error
-		ipv4, hnerr = externalIP()
-		if hnerr != nil {
-			log.Fatal("Can't get host name", hnerr)
-		}
-	}
-	return ipv4
-}
-
-func (r *Route53Registry) getPublicIPv4() string {
-	var ipv4 string
-	// determine the hostname
-	if r.useEc2Meatadata {
-		var hnerr error
-		ipv4, hnerr = ec2Meta("public-ipv4")
-		if hnerr != nil {
-			log.Fatal("Unable to determine EC2 public ipv4, defaulting to internal lookup")
-			ipv4, _ = externalIP()
-		}
-	} else {
-		var hnerr error
-		ipv4, hnerr = externalIP()
-		if hnerr != nil {
-			log.Fatal("Can't get IPv4", hnerr)
-		}
-	}
-	return ipv4
-}
-
-func externalIP() (string, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue // interface down
-		}
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue // loopback interface
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			return "", err
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() {
-				continue
-			}
-			ip = ip.To4()
-			if ip == nil {
-				continue // not an ipv4 address
-			}
-			return ip.String(), nil
-		}
-	}
-	return "", errors.New("are you connected to the network?")
+	return recordName
 }
