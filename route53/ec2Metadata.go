@@ -14,6 +14,14 @@ func (r *Route53Registry) getTxtDomain() string {
 	return fmt.Sprintf("%s.services.%s", r.getLocalHostname(), r.dnsSuffix)
 }
 
+func (r *Route53Registry) getTxtID() string {
+	id, err := ec2Meta(`instance-id`)
+	if err != nil {
+		return r.getHostname()
+	}
+	return id
+}
+
 func (r *Route53Registry) getHostname() string {
 	if "" == r.hostname {
 		// determine the hostname

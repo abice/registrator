@@ -103,7 +103,7 @@ func (r *Route53Registry) Services() ([]*bridge.Service, error) {
 		HostedZoneId:          aws.String(r.zoneID),
 		StartRecordType:       aws.String(r53.RRTypeTxt),
 		StartRecordName:       aws.String(r.getTxtDomain()),
-		StartRecordIdentifier: aws.String(r.getHostname()),
+		StartRecordIdentifier: aws.String(r.getTxtID()),
 	}
 
 	resp, err := r.client.ListResourceRecordSets(params)
@@ -165,7 +165,7 @@ func (r *Route53Registry) Register(service *bridge.Service) error {
 	r.updateLocalARecord(service, "UPSERT")
 	r.updatePublicARecord(service, "UPSERT")
 
-	r.appendToRecordSet(r.getTxtDomain(), r53.RRTypeTxt, fmt.Sprintf(`"%s"`, service.ID), r.getHostname())
+	r.appendToRecordSet(r.getTxtDomain(), r53.RRTypeTxt, fmt.Sprintf(`"%s"`, service.ID), r.getTxtID())
 
 	err := r.appendToRecordSet(name, r53.RRTypeSrv, fmt.Sprintf("1 1 %d %s", service.Port, hostname), r.getRecordID(name))
 
@@ -184,7 +184,7 @@ func (r *Route53Registry) Deregister(service *bridge.Service) error {
 	r.updateLocalARecord(service, "DELETE")
 	r.updatePublicARecord(service, "DELETE")
 	err := r.removeFromRecordSet(name, r53.RRTypeSrv, fmt.Sprintf("1 1 %d %s", service.Port, hostname), r.getRecordID(name))
-	r.removeFromRecordSet(r.getTxtDomain(), r53.RRTypeTxt, service.ID, r.getHostname())
+	r.removeFromRecordSet(r.getTxtDomain(), r53.RRTypeTxt, service.ID, r.getTxtID())
 
 	return err
 }
