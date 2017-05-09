@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+
+	"github.com/gliderlabs/registrator/bridge"
 )
 
 func (r *Route53Registry) getTxtDomain() string {
@@ -20,6 +22,10 @@ func (r *Route53Registry) getTxtID() string {
 		return r.getHostname()
 	}
 	return id
+}
+
+func (r *Route53Registry) getTxtValue(service *bridge.Service) string {
+	return fmt.Sprintf(`"%s|%s|%s|%s"`, service.ID, r.getLocalIPv4(), r.getPublicIPv4(), service.Name)
 }
 
 func (r *Route53Registry) getHostname() string {

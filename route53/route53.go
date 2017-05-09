@@ -126,8 +126,16 @@ func (r *Route53Registry) Services() ([]*bridge.Service, error) {
 			}
 			value := strings.TrimSuffix(strings.TrimPrefix(*record.Value, `"`), `"`)
 			// ip-10-174-54-189:ecs-fluentd-aggr-7-fluentd-aggr-def08de0ae8ef9977c00:24225
-			parts := strings.Split(value, `:`)
-			if len(parts) != 3 {
+			parts := strings.Split(value, `|`)
+			var serviceIDValue string
+			if len(parts) < 4 {
+				log.Printf("Route53: Not sure if the IPs just didn't get put in, so maybe we'll try for just using the ID")
+				serviceIDValue = value
+			} else {
+				serviceIDValue = parts[0]
+			}
+			serviceIDparts := strings.Split(serviceIDValue, `:`)
+			if len(serviceIDparts) != 3 {
 				log.Printf("Route53: Skipping malformed Registrator Service record: %s\n", value)
 				continue
 			}
@@ -141,7 +149,7 @@ func (r *Route53Registry) Services() ([]*bridge.Service, error) {
 
 				services = append(services, &bridge.Service{
 					ID:   value,
-					Name: strings.TrimSuffix(strings.Replace(*rrs.Name, r.dnsSuffix, ``, -1), `.`),
+					Name: parts[3],
 					Port: port,
 					TTL:  (int)(*rrs.TTL),
 				})
@@ -158,14 +166,14 @@ func (r *Route53Registry) Register(service *bridge.Service) error {
 	log.Printf("Route53: Registering service %s||%s\n", service.ID, service.Name)
 
 	// query Route53 for existing records
-	name := service.Name + "." + r.dnsSuffix
+	name := r.getServiceName(service)
 
 	// determine the hostname
 	hostname := r.getHostname()
 	r.updateLocalARecord(service, "UPSERT")
 	r.updatePublicARecord(service, "UPSERT")
 
-	r.appendToRecordSet(r.getTxtDomain(), r53.RRTypeTxt, fmt.Sprintf(`"%s"`, service.ID), r.getTxtID())
+	r.appendToRecordSet(r.getTxtDomain(), r53.RRTypeTxt, r.getTxtValue(service), r.getTxtID())
 
 	err := r.appendToRecordSet(name, r53.RRTypeSrv, fmt.Sprintf("1 1 %d %s", service.Port, hostname), r.getRecordID(name))
 
@@ -176,7 +184,7 @@ func (r *Route53Registry) Deregister(service *bridge.Service) error {
 	log.Printf("Route53: Deregistering service %s || %s\n", service.ID, service.Name)
 
 	// query Route53 for existing records
-	name := service.Name + "." + r.dnsSuffix
+	name := r.getServiceName(service)
 
 	// determine the hostname
 	hostname := r.getHostname()
@@ -184,9 +192,14 @@ func (r *Route53Registry) Deregister(service *bridge.Service) error {
 	r.updateLocalARecord(service, "DELETE")
 	r.updatePublicARecord(service, "DELETE")
 	err := r.removeFromRecordSet(name, r53.RRTypeSrv, fmt.Sprintf("1 1 %d %s", service.Port, hostname), r.getRecordID(name))
-	r.removeFromRecordSet(r.getTxtDomain(), r53.RRTypeTxt, service.ID, r.getTxtID())
+	r.removeFromRecordSet(r.getTxtDomain(), r53.RRTypeTxt, r.getTxtValue(service), r.getTxtID())
 
 	return err
+}
+
+func (r *Route53Registry) getServiceName(service *bridge.Service) string {
+	// return fmt.Sprintf("%s.%s", service.Name, r.dnsSuffix)
+	return fmt.Sprintf("_%s._%s.%s", service.Name, "tcp", r.dnsSuffix)
 }
 
 func (r *Route53Registry) Refresh(service *bridge.Service) error {
@@ -283,7 +296,7 @@ func (slice ResourceRecordSet) typeIs(t string) bool {
 	return false
 }
 
-func (r *Route53Registry) updateLocalARecord(service *bridge.Service, action string) error {
+func (r *Route53Registry) updateLocalARecord(service *bridge.Service, action string) (string, error) {
 	name := service.Name + "." + r.dnsSuffix
 	result := false
 	if pubRecord, ok := service.Attrs[PublishLocalARecord]; ok {
@@ -293,25 +306,27 @@ func (r *Route53Registry) updateLocalARecord(service *bridge.Service, action str
 		}
 	}
 	var err error
+	var ip string
 	if result {
+		ip = r.getLocalIPv4()
 		switch strings.ToUpper(action) {
 		case "UPSERT":
 			log.Printf("Route53: Appending LocalARecord %s\n", name)
-			err = r.appendToRecordSet(name, r53.RRTypeA, r.getLocalIPv4(), r.getRecordID(name))
+			err = r.appendToRecordSet(name, r53.RRTypeA, ip, r.getRecordID(name))
 			break
 		case "DELETE":
 			log.Printf("Route53: Appending LocalARecord %s\n", name)
-			err = r.removeFromRecordSet(name, r53.RRTypeA, r.getLocalIPv4(), r.getRecordID(name))
+			err = r.removeFromRecordSet(name, r53.RRTypeA, ip, r.getRecordID(name))
 			break
 		default:
 			log.Printf("Unknown action: %s", action)
 		}
-		return err
+		return ip, err
 	}
-	return nil
+	return ip, nil
 }
 
-func (r *Route53Registry) updatePublicARecord(service *bridge.Service, action string) error {
+func (r *Route53Registry) updatePublicARecord(service *bridge.Service, action string) (string, error) {
 	name := service.Name + "." + r.dnsSuffix
 	result := false
 	if pubRecord, ok := service.Attrs[PublishPublicARecord]; ok {
@@ -321,22 +336,24 @@ func (r *Route53Registry) updatePublicARecord(service *bridge.Service, action st
 		}
 	}
 	var err error
+	var ip string
 	if result {
+		ip = r.getPublicIPv4()
 		switch strings.ToUpper(action) {
 		case "UPSERT":
 			log.Printf("Route53: Appending PublicARecord %s\n", name)
-			err = r.appendToRecordSet(name, r53.RRTypeA, r.getPublicIPv4(), r.getRecordID(name))
+			err = r.appendToRecordSet(name, r53.RRTypeA, ip, r.getRecordID(name))
 			break
 		case "DELETE":
 			log.Printf("Route53: Appending PublicARecord %s\n", name)
-			err = r.removeFromRecordSet(name, r53.RRTypeA, r.getPublicIPv4(), r.getRecordID(name))
+			err = r.removeFromRecordSet(name, r53.RRTypeA, ip, r.getRecordID(name))
 			break
 		default:
 			log.Printf("Unknown action: %s", action)
 		}
-		return err
+		return ip, err
 	}
-	return nil
+	return ip, nil
 }
 
 func (r *Route53Registry) appendToRecordSet(name string, recordType string, value string, identifier string) error {
