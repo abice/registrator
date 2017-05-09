@@ -199,7 +199,7 @@ func (r *Route53Registry) Deregister(service *bridge.Service) error {
 
 func (r *Route53Registry) getServiceName(service *bridge.Service) string {
 	// return fmt.Sprintf("%s.%s", service.Name, r.dnsSuffix)
-	return fmt.Sprintf("_%s._%s.%s", service.Name, "tcp", r.dnsSuffix)
+	return fmt.Sprintf("_%s._%s.%s", service.Name, service.Origin.PortType, r.dnsSuffix)
 }
 
 func (r *Route53Registry) Refresh(service *bridge.Service) error {
