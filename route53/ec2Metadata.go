@@ -17,6 +17,9 @@ func (r *Route53Registry) getTxtDomain() string {
 }
 
 func (r *Route53Registry) getTxtID() string {
+	if !r.useEc2Meatadata {
+		return r.getHostname()
+	}
 	id, err := ec2Meta(`instance-id`)
 	if err != nil {
 		return r.getHostname()
@@ -44,6 +47,7 @@ func (r *Route53Registry) getHostname() string {
 			if hnerr != nil {
 				log.Fatal("Can't get host name", hnerr)
 			}
+			log.Println("Hostname", r.hostname)
 		}
 	}
 	return r.hostname

@@ -1,0 +1,45 @@
+package: github.com/gliderlabs/registrator
+import:
+- package: github.com/aws/aws-sdk-go
+  version: v1.10.50
+  subpackages:
+  - aws
+  - aws/awserr
+  - aws/request
+  - aws/session
+  - service/route53
+  - service/route53/route53iface
+- package: github.com/cenkalti/backoff
+  version: v1.1.0
+- package: github.com/coreos/go-etcd
+  version: v2.0.0
+  subpackages:
+  - etcd
+- package: github.com/fsouza/go-dockerclient
+- package: github.com/gliderlabs/pkg
+  subpackages:
+  - usage
+- package: github.com/hashicorp/consul
+  version: v0.9.3
+  subpackages:
+  - api
+- package: github.com/hashicorp/go-cleanhttp
+- package: github.com/samuel/go-zookeeper
+  subpackages:
+  - zk
+- package: github.com/stretchr/testify
+  version: v1.1.4
+  subpackages:
+  - mock
+- package: gopkg.in/coreos/go-etcd.v0
+  version: v2.0.0
+  subpackages:
+  - etcd
+- package: github.com/sirupsen/logrus
+  version: v1.0.3
+- package: github.com/Sirupsen/logrus
+  repo: git@github.com:/sirupsen/logrus
+  vcs: git
+testImport:
+- package: github.com/satori/go.uuid
+  version: v1.1.0

@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -63,6 +65,9 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 		zoneID:          zoneID,
 		dnsPrefix:       dnsPrefix,
 		recordPerHost:   recordPerHost,
+		serviceCache:    map[string]*bridge.Service{},
+		cacheLock:       new(sync.RWMutex),
+		syncAt:          time.Now().Add(-1 * time.Minute),
 	}
 }
 
@@ -75,7 +80,9 @@ type Route53Registry struct {
 	dnsPrefix       string
 	hostname        string
 	recordPerHost   bool
-	containerLookup map[string]string
+	serviceCache    map[string]*bridge.Service
+	cacheLock       *sync.RWMutex
+	syncAt          time.Time
 }
 
 // Ping gets the hosted zone name. This name will be used
@@ -117,14 +124,14 @@ func (r *Route53Registry) Services() ([]*bridge.Service, error) {
 			log.Printf("Skipping non TXT record for services")
 			continue
 		}
-		log.Printf("ResourceRecordSets %s", rrs.GoString())
+		// log.Printf("ResourceRecordSets %s", rrs.GoString())
 
 		for _, record := range rrs.ResourceRecords {
 			if record.Value == nil {
 				log.Println("Route53: Skipping null Record Value")
 				continue
 			}
-			value := strings.TrimSuffix(strings.TrimPrefix(*record.Value, `"`), `"`)
+			value := strings.Trim(*record.Value, `"`)
 			// ip-10-174-54-189:ecs-fluentd-aggr-7-fluentd-aggr-def08de0ae8ef9977c00:24225
 			parts := strings.Split(value, `|`)
 			var serviceIDValue string
@@ -139,30 +146,64 @@ func (r *Route53Registry) Services() ([]*bridge.Service, error) {
 				log.Printf("Route53: Skipping malformed Registrator Service record: %s\n", value)
 				continue
 			}
-			if parts[0] == hostname || parts[0] == r.getLocalHostname() {
+			if serviceIDparts[0] == hostname || serviceIDparts[0] == r.getLocalHostname() {
 				// This is a local service, so we should return it.
-				port, err := strconv.Atoi(parts[2])
+				port, err := strconv.Atoi(serviceIDparts[2])
 				if err != nil {
 					log.Println("Route53: Skipping unparseable port")
 					continue
+				}
+				ttl := TTL
+				if rrs.TTL != nil {
+					ttl = int(*rrs.TTL)
 				}
 
 				services = append(services, &bridge.Service{
 					ID:   value,
 					Name: parts[3],
 					Port: port,
-					TTL:  (int)(*rrs.TTL),
+					TTL:  ttl,
 				})
 			}
 		}
 	}
 
 	log.Println("Existing Services", services)
+	for _, service := range services {
+		r.cacheService(service)
+	}
 
 	return services, err
 }
 
+func (r *Route53Registry) registered(service *bridge.Service) bool {
+	r.cacheLock.RLock()
+	_, ok := r.serviceCache[service.ID]
+	r.cacheLock.RUnlock()
+
+	return ok
+}
+
+func (r *Route53Registry) cacheService(service *bridge.Service) {
+	r.cacheLock.Lock()
+	r.serviceCache[service.ID] = service
+	r.cacheLock.Unlock()
+}
+
+func (r *Route53Registry) removeFromCache(service *bridge.Service) {
+	r.cacheLock.Lock()
+	delete(r.serviceCache, service.ID)
+	r.cacheLock.Unlock()
+}
+
 func (r *Route53Registry) Register(service *bridge.Service) error {
+	if time.Now().After(r.syncAt) {
+		r.Services()
+		r.syncAt = time.Now().Add(1 * time.Minute)
+	}
+	if r.registered(service) {
+		return nil
+	}
 	log.Printf("Route53: Registering service %s||%s\n", service.ID, service.Name)
 
 	// query Route53 for existing records
@@ -176,13 +217,14 @@ func (r *Route53Registry) Register(service *bridge.Service) error {
 	r.appendToRecordSet(r.getTxtDomain(), r53.RRTypeTxt, r.getTxtValue(service), r.getTxtID())
 
 	err := r.appendToRecordSet(name, r53.RRTypeSrv, fmt.Sprintf("1 1 %d %s", service.Port, hostname), r.getRecordID(name))
-
+	r.cacheService(service)
 	return err
 }
 
 func (r *Route53Registry) Deregister(service *bridge.Service) error {
 	log.Printf("Route53: Deregistering service %s || %s\n", service.ID, service.Name)
 
+	r.removeFromCache(service)
 	// query Route53 for existing records
 	name := r.getServiceName(service)
 
@@ -283,14 +325,14 @@ func (slice ResourceRecords) pos(value string) int {
 type ResourceRecordSet []*r53.ResourceRecordSet
 
 func (slice ResourceRecordSet) nameIs(name string) bool {
-	if slice != nil && *slice[0].Name == name {
+	if slice != nil && slice[0].Name != nil && *slice[0].Name == name {
 		return true
 	}
 	return false
 }
 
 func (slice ResourceRecordSet) typeIs(t string) bool {
-	if slice != nil && *slice[0].Type == t {
+	if slice != nil && slice[0].Type != nil && *slice[0].Type == t {
 		return true
 	}
 	return false
