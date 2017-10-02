@@ -142,7 +142,7 @@ func (r *Route53Registry) Services() ([]*bridge.Service, error) {
 				serviceIDValue = parts[0]
 			}
 			serviceIDparts := strings.Split(serviceIDValue, `:`)
-			if len(serviceIDparts) != 3 {
+			if len(serviceIDparts) < 3 {
 				log.Printf("Route53: Skipping malformed Registrator Service record: %s\n", value)
 				continue
 			}
